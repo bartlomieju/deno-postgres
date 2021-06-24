@@ -42,8 +42,9 @@ import {
   RowDescription,
 } from "../query/query.ts";
 import { Column } from "../query/decode.ts";
-import type { ConnectionParams } from "./connection_params.ts";
+import type { ClientConfiguration } from "./connection_params.ts";
 import * as scram from "./scram.ts";
+import { ConnectionError } from "./warning.ts";
 
 enum TransactionStatus {
   Idle = "I",
@@ -119,7 +120,8 @@ export class Connection {
   #bufWriter!: BufWriter;
   #conn!: Deno.Conn;
   connected = false;
-  #connection_params: ConnectionParams;
+  #connection_params: ClientConfiguration;
+  #onDisconnection: () => Promise<void>;
   #packetWriter = new PacketWriter();
   // TODO
   // Find out what parameters are for
@@ -129,6 +131,7 @@ export class Connection {
     1,
     [undefined],
   );
+  #reconnection_attempts = 0;
   // TODO
   // Find out what the secret key is for
   // Clean on startup
@@ -148,8 +151,12 @@ export class Connection {
     return this.#tls;
   }
 
-  constructor(connection_params: ConnectionParams) {
+  constructor(
+    connection_params: ClientConfiguration,
+    disconnection_callback: () => Promise<void>,
+  ) {
     this.#connection_params = connection_params;
+    this.#onDisconnection = disconnection_callback;
   }
 
   /** Read single message sent by backend */
@@ -158,6 +165,18 @@ export class Connection {
     const header = new Uint8Array(5);
     await this.#bufReader.readFull(header);
     const msgType = decoder.decode(header.slice(0, 1));
+    // TODO
+    // Investigate if the ascii terminator is the best way to check for a broken
+    // session
+    if (msgType === "\x00") {
+      // This error means that the database terminated the session without notifying
+      // the library
+      // TODO
+      // This will be removed once we move to async handling of messages by the frontend
+      // However, unnotified disconnection will remain a possibility, that will likely
+      // be handled in another place
+      throw new ConnectionError("The session was terminated by the database");
+    }
     const msgLength = readUInt32BE(header, 1) - 4;
     const msgBody = new Uint8Array(msgLength);
     await this.#bufReader.readFull(msgBody);
@@ -245,12 +264,30 @@ export class Connection {
         "You need to execute Deno with the `--unstable` argument in order to stablish a TLS connection",
       );
     }
-  } /**
-   * Calling startup on a connection twice will create a new session and overwrite the previous one
-   * https://www.postgresql.org/docs/13/protocol-flow.html#id-1.10.5.7.3
-   * */
+  }
 
-  async startup() {
+  #resetConnectionMetadata() {
+    try {
+      this.#conn.close();
+    } catch (_e) {
+      // Swallow error
+    }
+    this.connected = false;
+    this.#packetWriter = new PacketWriter();
+    this.#parameters = {};
+    this.#pid = undefined;
+    this.#queryLock = new DeferredStack(
+      1,
+      [undefined],
+    );
+    this.#secretKey = undefined;
+    this.#tls = false;
+    this.#transactionStatus = undefined;
+  }
+
+  async #startup() {
+    this.#resetConnectionMetadata();
+
     const {
       hostname,
       port,
@@ -291,6 +328,8 @@ export class Connection {
         }
       }
     } else if (enforceTLS) {
+      // Make sure to close the connection before erroring
+      this.#conn.close();
       throw new Error(
         "The server isn't accepting TLS connections. Change the client configuration so TLS configuration isn't required to connect",
       );
@@ -357,6 +396,52 @@ export class Connection {
     } catch (e) {
       this.#conn.close();
       throw e;
+    }
+  }
+
+  /**
+   * Calling startup on a connection twice will create a new session and overwrite the previous one
+   *
+   * @param is_reconnection This indicates whether the startup should behave as if there was
+   * a connection previously established, or if it should attempt to create a connection first
+   *
+   * https://www.postgresql.org/docs/13/protocol-flow.html#id-1.10.5.7.3
+   * */
+  async startup(is_reconnection: boolean) {
+    this.#reconnection_attempts = 0;
+    const max_reconnections = this.#connection_params.connection.attempts;
+
+    let error: Error | undefined;
+    // If no connection has been established and the reconnection attempts are
+    // set to zero, attempt to connect at least once
+    if (!is_reconnection && this.#connection_params.connection.attempts === 0) {
+      try {
+        await this.#startup();
+      } catch (e) {
+        error = e;
+      }
+    } else {
+      // If the reconnection attempts are set to zero the client won't attempt to
+      // reconnect, but it won't error either, this "no reconnections" behavior
+      // should be handled wherever the reconnection is requested
+      while (this.#reconnection_attempts < max_reconnections) {
+        try {
+          await this.#startup();
+          break;
+        } catch (e) {
+          // TODO
+          // Eventually distinguish between connection errors and normal errors
+          this.#reconnection_attempts++;
+          if (this.#reconnection_attempts === max_reconnections) {
+            error = e;
+          }
+        }
+      }
+    }
+
+    if (error) {
+      await this.end();
+      throw error;
     }
   }
 
@@ -763,6 +848,10 @@ export class Connection {
       // no data
       case "n":
         break;
+      // notice response
+      case "N":
+        result.warnings.push(await this.#processNotice(msg));
+        break;
       // error
       case "E":
         await this.#processError(msg);
@@ -789,6 +878,10 @@ export class Connection {
           result.done();
           break outerLoop;
         }
+        // notice response
+        case "N":
+          result.warnings.push(await this.#processNotice(msg));
+          break;
         // error response
         case "E":
           await this.#processError(msg);
@@ -816,6 +909,10 @@ export class Connection {
       throw new Error("The connection hasn't been initialized");
     }
 
+    // TODO
+    // Please forgive me
+    // This will all be removed once the message handling is refactored to receive
+    // messages at any point in time, not only as a response to a request
     await this.#queryLock.pop();
     try {
       if (query.args.length === 0) {
@@ -823,6 +920,23 @@ export class Connection {
       } else {
         return await this.#preparedQuery(query);
       }
+    } catch (e) {
+      if (
+        e instanceof ConnectionError
+      ) {
+        // Don't even try to reconnect if reconnection is disabled
+        if (this.#connection_params.connection.attempts === 0) {
+          await this.end();
+        } else {
+          try {
+            await this.startup(true);
+            return this.query(query);
+          } catch (_e) {
+            throw e;
+          }
+        }
+      }
+      throw e;
     } finally {
       this.#queryLock.push(undefined);
     }
@@ -878,15 +992,17 @@ export class Connection {
 
   async end(): Promise<void> {
     if (this.connected) {
-      // TODO
-      // Remove all session metadata
-      this.#pid = undefined;
-
       const terminationMessage = new Uint8Array([0x58, 0x00, 0x00, 0x00, 0x04]);
       await this.#bufWriter.write(terminationMessage);
-      await this.#bufWriter.flush();
-      this.#conn.close();
-      this.connected = false;
+      try {
+        await this.#bufWriter.flush();
+        this.#conn.close();
+      } catch (_e) {
+        // This steps can fail if the underlying connection has been closed ungracefully
+      } finally {
+        this.#resetConnectionMetadata();
+        this.#onDisconnection();
+      }
     }
   }
 }
